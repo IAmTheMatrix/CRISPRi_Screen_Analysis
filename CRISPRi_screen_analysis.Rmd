@@ -1,0 +1,788 @@
+---
+title: "CRISRPi Screen Analysis"
+author: "Cosimo Jann"
+date: "2020/08/14"
+output:
+  html_document:
+    df_print: paged
+highlight: tango
+df_print: paged
+self_contained: yes
+code_download: yes
+toc_depth: 2
+toc_float: no
+---
+
+```{r set basic options, include=FALSE}
+library(knitr)
+options(digits=3, width=80)
+golden_ratio <- (1 + sqrt(5)) / 2
+opts_chunk$set(echo=TRUE,tidy=FALSE,include=TRUE,
+               dev=c('png', 'pdf', 'svg'), fig.height = 5, fig.width = 4 * golden_ratio, comment = '  ', dpi = 300,
+               cache = TRUE)
+```
+
+**LAST UPDATE AT**
+  
+  ```{r print date, echo=FALSE, cache=FALSE}
+print(date())
+```
+
+Set working directory and load packages
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = '/Users/jann/Desktop/Dependencies/')
+getwd()
+
+library(stringr)
+library(edgeR)
+library(statmod)
+library(ggplot2)
+library(tidyverse)
+library(dplyr)
+require(zoo)
+library(pheatmap)
+library(scales)
+library(LSD)
+```
+
+
+Read in dependency files
+```{r setup2}
+#read in annotations 1
+fullAnno = read.table("Full_Annotations_table.txt", header=T, sep="\t")
+
+#read in annotations 2
+full_features300 = read.table("Full_Features300.txt", header=T, sep="\t")
+
+#read in ORF to Gene conversion file
+ORF_to_Gene <- read.delim("ORF_to_Gene_conversion_yeastract.csv", header = T, sep=",")
+
+#read in annotations of essential genes:
+essentialAnnotations = read.delim("inviable_annotations.txt", sep = "\t", header = T, skip = 7)
+essentialORFs = essentialAnnotations$Gene.Systematic.Name[essentialAnnotations$Strain.Background=="S288C" & essentialAnnotations$Mutant.Information=="null"]
+
+```
+
+Read in demultiplexed read count files of screens, e.g. cellular fitness at 30°C:
+```{r data read}
+Rep12TF_30degC = read.delim("HS_Screen2_perfectMatch_ReadCounts_TFs.txt")
+Rep12TF_30degC <- Rep12TF_30degC[,17:20]
+colnames(Rep12TF_30degC) <- sub("11_", "_Rep1_", colnames(Rep12TF_30degC))
+colnames(Rep12TF_30degC) <- sub("22_", "_Rep2_", colnames(Rep12TF_30degC))
+pre_names <- lapply( strsplit(colnames(Rep12TF_30degC), "_"), function(x){unlist(x)[c(1, 4, 2)]})
+colnames(Rep12TF_30degC) <- paste( c(lapply(pre_names, function(z){str_c(z, collapse = "_")})) )
+
+Rep12Kin_30degC = read.delim("HS_Screen2_perfectMatch_ReadCounts_Kinases.txt")
+Rep12Kin_30degC <- Rep12Kin_30degC[,13:16]
+colnames(Rep12Kin_30degC) <- sub("11_", "_Rep1_", colnames(Rep12Kin_30degC))
+colnames(Rep12Kin_30degC) <- sub("22_", "_Rep2_", colnames(Rep12Kin_30degC))
+pre_names <- lapply( strsplit(colnames(Rep12Kin_30degC), "_"), function(x){unlist(x)[c(1, 4, 2)]})
+colnames(Rep12Kin_30degC) <- paste( c(lapply(pre_names, function(z){str_c(z, collapse = "_")})) )
+
+```
+
+Filtering low counts based on MinusATc samples (these are unperturbed).
+```{r filter counts, include=FALSE}
+#filter out rows (guides) with more than one sample of counts smaller or equal to 20:
+TF_MinusATc = Rep12TF_30degC[,c(1,3)]
+Kin_MinusATc = Rep12Kin_30degC[,c(1,3)]
+#filter control, listing low counts which are rejected by the filter:
+LowCounts_MinusATcSamples_TF = TF_MinusATc[!(rowMeans(TF_MinusATc)>20),]        #10 guides filtered out
+LowCounts_MinusATcSamples_Kin = Kin_MinusATc[!(rowMeans(Kin_MinusATc)>20),]     #24 guides filtered out
+
+#check guides that could be filtered if threshold would be increased, e.g. to 50. With current setting, these are maintained:
+Filtered_TF = Rep12TF_30degC[(rowMeans(TF_MinusATc)>20),]
+Filtered_TF[!(rowMeans(Filtered_TF)>50),]
+Filtered_Kin = Rep12Kin_30degC[(rowMeans(Kin_MinusATc)>20),]
+Filtered_Kin[!(rowMeans(Filtered_Kin)>50),]
+
+#filter applied, resulting in counts:
+Counts_TF = Rep12TF_30degC[!(rownames(Rep12TF_30degC)%in%rownames(LowCounts_MinusATcSamples_TF)),]
+Counts_Kin = Rep12Kin_30degC[!(rownames(Rep12Kin_30degC)%in%rownames(LowCounts_MinusATcSamples_Kin)),]
+```
+
+Generate annotation table and define edgeR pipeline function to compute guide log2FCs:
+```{r annotation table and edgeR analysis function}
+#Generate ann table for TF and Kin libraries:
+tblGenerate <- function(ReadCounts){
+  annTable = t(sapply(strsplit(colnames(ReadCounts),"_"),unlist))
+  annTable = data.frame(annTable)
+  colnames(annTable)  = c("temperature","atc","replicate")
+  annTable$grp  = paste(annTable$temperature, annTable$atc, sep="_")
+  annTable$grp <- as.factor(annTable$grp)
+  annTable$grp <- relevel(annTable$grp, ref="Thirty_MinusATc")
+  annTable
+}
+ann_TF <- tblGenerate(ReadCounts = Counts_TF)
+ann_Kin <- tblGenerate(ReadCounts = Counts_Kin)
+
+#edgeR pipeline to compute FDRs on guide level:
+fitGuideModel <- function(counts, annTable){
+  Group <- annTable$grp
+  y  = DGEList(counts, group=Group)
+  y  = calcNormFactors(y)
+  plotMDS(y)
+  
+  #define model
+  design <- model.matrix(~0+grp+replicate, data=annTable)
+  yDisp <- estimateDisp(y, design, robust = T)
+  #control BCV:
+  plotBCV(yDisp)
+  #plotSmear(yDisp)
+  fit = glmFit(yDisp, design, robust=T)
+  
+  #test for ATc effect at 30degC
+  lrt = glmLRT(fit, contrast = c(-1, 1, 0))
+  tab_ThirtyFC = topTags((lrt),n=nrow(yDisp))$table
+  
+  #inspect log2FCs
+  hist(tab_ThirtyFC$logFC, breaks=50)
+  #inspect p-values
+  hist(tab_ThirtyFC$PValue, breaks=50)
+  #inspect FDRs
+  #hist(tab_ThirtyFC$FDR, breaks=50)
+
+  #inspect effects
+  plotMD(lrt)
+  abline(h=c(-1,1), col="blue")
+  
+  tab_ThirtyFC$rname = rownames(tab_ThirtyFC)
+  tab_ThirtyFC = tab_ThirtyFC %>% mutate(screen = "ThirtyFC")
+
+  #merge annotations1
+  fullAnno$mergeCol <-  sapply(fullAnno$mergeCol, function(u){ sub("late", "", u)})
+  
+  #Merge annotations2 with Gene_ORF_conversion file
+  #Choosing 150bp distance cutoff to determine transcriptional start sites that are potentially regulated by a gRNA:
+  full_features150 <- full_features300[abs(full_features300$Midpoint_TSS_dist)<=150,]
+  
+  tabSelection = list("tab_ThirtyFC"=tab_ThirtyFC)
+  allTabsList <- lapply(tabSelection, function(i){
+    i$mergeCol <-  sapply(i$rname, function(u){ paste( unlist(strsplit(u, ":"))[c(2, 3, 4) ], collapse = ":") })
+    i$mergeCol <-  sapply(i$mergeCol, function(u){ paste( unlist(strsplit(u, "late-"))[1]) })
+    i$mergeCol <-  sapply(i$mergeCol, function(u){ sub("-noMode-noGuideCtr", "", u) })
+    
+    #annotate aimed strand and genomic positions
+    mergedDF <- merge(i, fullAnno, by="mergeCol")
+    
+    ##Guide RNA z-score calculation using mean and sd
+    mergedDF$z_logFC <- ( mergedDF$logFC - mean(mergedDF$logFC) )/sd(mergedDF$logFC) 
+    full_features300$Nearest_TSS_ORF <- as.character(full_features300$Nearest_TSS_ORF)
+    full_features300$Seq <- as.character(full_features300$Seq)
+    mergedDF$Seq <- as.character(mergedDF$Seq)
+    
+    #annotate target genes:
+    pre_mergedDF_designedTargets <- merge(mergedDF, full_features300[as.character(full_features300$Nearest_TSS_ORF) %in% as.character(mergedDF$ORF), ], 
+                                          by="Seq", all.x = T)
+    mergedDF_designedGeneTargets <- pre_mergedDF_designedTargets[!is.na(pre_mergedDF_designedTargets$Seq), ]
+    
+    #identify genes that are not designed targets but can potentially be regulated by guide RNAs, using 150bp distance threshold:
+    full_features150 = full_features300[abs(full_features300$Midpoint_TSS_dist) <=150,]
+    mergedDF_otherPotentialTargets <- merge(mergedDF, full_features150[!(as.character(full_features150$Nearest_TSS_ORF) %in% as.character(mergedDF_designedGeneTargets$ORF)), ], 
+                                                                        by="Seq", all.x = F, all.y = F) 
+    mergedDF_otherPotentialTargets = mergedDF_otherPotentialTargets[!mergedDF_otherPotentialTargets$Nearest_TSS_ORF %in% mergedDF_designedGeneTargets$Nearest_TSS_ORF,]
+    #potential ORF targets in 150bp distance to the gRNA which are not already included in the designed target ORFs
+    
+    #annotate target
+    mergedDF_designedGeneTargets$designedTarget = "designed_target"
+    mergedDF_otherPotentialTargets$designedTarget = "potential_target"
+    
+    #combine designed and potential targets:
+    mergedDF_full = rbind(mergedDF_designedGeneTargets, mergedDF_otherPotentialTargets)
+    
+    #annotate gRNAs that target essential target genes
+    mergedDF_full$Nearest_ORF_essential = mergedDF_full$Nearest_TSS_ORF %in% as.character(essentialORFs)
+    
+    #add gene names if available. Otherwise keep ORF name
+    knownORFs <- as.character(ORF_to_Gene$ORF_yeastractAnnotation[!ORF_to_Gene$ORF_yeastractAnnotation=="Unknown"])
+    mergedDF_full$Nearest_Gene <- as.character(mergedDF_full$Nearest_TSS_ORF)
+    for (k in as.character(mergedDF_full$Nearest_TSS_ORF[mergedDF_full$Nearest_TSS_ORF %in% knownORFs])){
+      mergedDF_full$Nearest_Gene[mergedDF_full$Nearest_TSS_ORF == k] = as.character(ORF_to_Gene$Gene_yeastractAnnotation[ORF_to_Gene$ORF_yeastractAnnotation == k])
+    }
+    
+    #annotate gRNAs with potential other target genes that the designed target gene within a 150bp distance to the guide:
+    guideRNA_TargetNumber = data.frame(table(as.character(mergedDF_full$Seq)))
+    colnames(guideRNA_TargetNumber) = c("Seq", "guideRNA_TargetNumber")
+    mergedDF_full <- merge(mergedDF_full, guideRNA_TargetNumber, by="Seq")
+    
+    #add columns to specify ORF and Gene names of gRNAs with multiple targets
+    for (i in mergedDF_full$Seq){
+      mergedDF_full$TargetORFs150bpDistance[mergedDF_full$Seq==i] <- paste0( sort( mergedDF_full$Nearest_TSS_ORF[mergedDF_full$Seq==i]), collapse = "|" )
+      mergedDF_full$targetGenes150bpDistance[mergedDF_full$Seq==i] <- paste0( sort( mergedDF_full$Nearest_Gene[mergedDF_full$Seq==i]), collapse = "|" )
+      #Add number of potentially regulated genes (TSS in 150bp distance):
+      mergedDF_full$targetORFs150bpDistanceNumber[mergedDF_full$Seq==i] <- length(mergedDF_full$Nearest_TSS_ORF[mergedDF_full$Seq==i])
+      #indicate which TSS is the closest to the gRNA midpoint
+      mergedDF_full$Nearest_abs_TSS_distance[mergedDF_full$Seq==i] = min( abs(mergedDF_full$Midpoint_TSS_dist[mergedDF_full$Seq==i] ) )
+      mergedDF_full$Nearest_Guide_to_TSS[mergedDF_full$Seq==i] <- mergedDF_full$Nearest_abs_TSS_distance[mergedDF_full$Seq==i] == abs(mergedDF_full$Midpoint_TSS_dist[mergedDF_full$Seq==i])
+    }
+    
+    #annotate if there is ANY essential gene in 150 bp neighborhood    
+    mergedDF_full$essential_any = 
+      apply(mergedDF_full, 1, function(pp){
+        orfs150bp <- unlist(strsplit(as.character(pp[33]), split="|", fixed=T))
+        essential_any = any(orfs150bp %in% as.character(essentialORFs))
+        return(essential_any)
+      })
+    
+    #annotate if intentionally targeted ORF is essential
+    mergedDF_full$essential_target = 
+      apply(mergedDF_full, 1, function(pp){
+        targeted_orfs <- as.character(pp[10])
+        essential_any = any(targeted_orfs %in% as.character(essentialORFs))
+        return(essential_any)
+      })
+
+    #The gRNAs designed to target GAT4 are further than 1kp to their target TSS and likely to not target any gene effectively and do not have significant FCs. 
+    #The wt sequence is treated as a guide sequence (intact NotI site as non-functional gRNA control).
+    mergedDF_full[is.na(mergedDF_full$Nearest_Guide_to_TSS),]
+    ##
+    
+    mergedDF_full <-  mergedDF_full[order(mergedDF_full$Seq),]
+    return(mergedDF_full)
+  })
+
+  return(allTabsList)
+}
+
+```
+
+Run function for libraries
+```{r execute}
+tab_TF <- fitGuideModel(counts = Counts_TF, annTable = ann_TF)
+tab_Kin <- fitGuideModel(counts = Counts_Kin, annTable = ann_Kin)
+
+tab_ThirtyFC <- rbind(tab_TF[[1]], tab_Kin[[1]])
+
+#keep only one instance of gRNA sequences with multiple targets (the designed target in gene column). Multiple targets of each gRNA are still annotated in target150bpGenes/ORFs columns.
+tab_ThirtyFC_singleGuide <- tab_ThirtyFC[tab_ThirtyFC$designedTarget=="designed_target",]
+
+#The gRNAs designed to target GAT4 are further than 1kp to their target TSS and likely to not target any gene effectively and do not have significant FCs. 
+#Can be used as control guides
+tab_ThirtyFC_singleGuide[!is.na(tab_ThirtyFC_singleGuide$Nearest_TSS_ORF),]
+tab_ThirtyFC_singleGuide_noNA <- tab_ThirtyFC_singleGuide[!is.na(tab_ThirtyFC_singleGuide$Seq),]
+
+#The wt sequence is treated as a guide sequence (intact NotI site as non-functional gRNA control). 
+#This is not an actual gRNA and is omitted here:
+tab_ThirtyFC <- tab_ThirtyFC_singleGuide_noNA[-grep("wt", tab_ThirtyFC_singleGuide_noNA$Seq),]
+
+```
+
+```{r minor adjustments}
+#convert factors
+tabs_List = list("tab_ThirtyFC"=tab_ThirtyFC)
+tabsData <- lapply(tabs_List, function(i){
+  i$ORF <- as.character(i$ORF)
+  i$Gene <- as.character(i$Gene)
+  i$Identity <- as.character(i$Identity)
+  i$Chromosome <- as.character(i$Chromosome)
+})
+
+tab_ThirtyFC <- tabs_List[[1]]
+
+##Genes that have more than 1 gRNA targeting another gene in 150bp neighborhood:
+annotateComplexLoci <- function(df){
+  #all bidirectional genes based on gRNAs that target the designed TSS and potential other TSSs in 150bp distance
+  bidirectional_Genes_any = unique(df$targetGenes150bpDistance[df$targetORFs150bpDistanceNumber>=2])
+  #bidirectional genes covered by at least 2 gRNAs: 55 gene loci
+  bidirectional_Genes = names(which(table(df$targetGenes150bpDistance[df$targetGenes150bpDistance %in% bidirectional_Genes_any]) >=2))
+
+  #regulation table
+  regTab = table(df[ , c("Gene","targetGenes150bpDistance")])
+  regDF = as.data.frame(regTab)
+  regDF$Gene = as.character(regDF$Gene)
+  regDF$targetGenes150bpDistance = as.character(regDF$targetGenes150bpDistance)
+  regDF$Freq = as.numeric(regDF$Freq)
+  regDF = regDF[regDF$Freq>=2, ]
+  #overview on bidirectional genes
+  GenesWithMoreThanOneGuidePotentiallyTargetingOtherTSS = unique(regDF[regDF$targetGenes150bpDistance %in% bidirectional_Genes, ])
+
+  #overview on genes in complex loci with more than 2 TSS in neighborhood
+  #tabulating on targeted Gene
+  table(GenesWithMoreThanOneGuidePotentiallyTargetingOtherTSS$Gene)
+  complexLoci = table(GenesWithMoreThanOneGuidePotentiallyTargetingOtherTSS$Gene)[table(GenesWithMoreThanOneGuidePotentiallyTargetingOtherTSS$Gene)>1]
+  GenesWithMoreThanOneGuidePotentiallyTargetingOtherTSS[GenesWithMoreThanOneGuidePotentiallyTargetingOtherTSS$Gene %in% names(complexLoci),]
+  
+  ##Annotate complex loci
+  #if multiple loci are formed from one common one, only take the largest locus (the one that includes all potentially targeted genes)
+  ddf = GenesWithMoreThanOneGuidePotentiallyTargetingOtherTSS %>% group_by(Gene) %>% do({
+    this = .
+    tgLength = sapply(this$targetGenes150bpDistance, function(u){length(strsplit(u, "|", fixed=T)[[1]])})
+    #get index of longest gene loci per gene target, if multiple, and use only the longest one as this one has all combinations of the whole locus
+    longest = this$targetGenes150bpDistance[which(tgLength == max(tgLength))]
+    Freq = sum(this$Freq)
+    output = data.frame(longest, Freq, stringsAsFactors = F)
+    output
+  })
+
+  #Replacing genes by the locus if multiple genes in the locus are targeted to account for multiple gene targets nearby the targeted region
+  df$GeneLocus_on_GeneLvL = as.character(df$Gene)
+  df$GeneLocus_on_GeneLvL[df$Gene %in% ddf$Gene] = sapply(df$Gene[df$Gene %in% ddf$Gene], function(pp){
+    geneReplacement = ddf$longest[ddf$Gene == pp]
+    geneReplacement
+  })
+  
+  #Replacing essentiality for aggregated essentiality
+  df$essential_any_aggregate = as.character(df$essential_any)
+  essential_GeneLoci = unique(df$GeneLocus_on_GeneLvL[df$essential_any]) #34 loci
+  df$essential_any_aggregate[df$GeneLocus_on_GeneLvL %in% essential_GeneLoci] = TRUE
+
+  #list guides that are twice in table due to multiple targets
+  doubleSeqs=names(table(df$Seq)[table(df$Seq)>=2])
+  #get index of guides that are not Nearest_Guide_to_TSS to get rid of them
+  doubleSeqIndex = df$Seq %in% doubleSeqs & df$Nearest_Guide_to_TSS==F
+  df = df[!doubleSeqIndex, ]
+  
+ #call output
+  df
+}
+
+tab_ThirtyFC = annotateComplexLoci(df=tab_ThirtyFC)
+tab_ThirtyFC$essential_any_aggregate = as.logical(tab_ThirtyFC$essential_any_aggregate)
+```
+
+Defining significant gRNAs in preparation for defining gene significance
+```{r gRNA significance}
+#Define gRNAs as significant if they exceed an absolute log2FC of 1 with an adjusted p-value (BH FDR) below 0.05 (parameters set in function). 
+#Define genes as significantly influenced if a gene is targeted by at least 2 significant gRNAs (see above) and the mean gene-level log2FC has an FDR below 0.05 
+callSig <- function(df, logFCcutoff){
+  df$positiveFC =  df$logFC>=logFCcutoff & df$FDR<=0.05 
+  df$negativeFC =  df$logFC<=(-logFCcutoff) & df$FDR<=0.05
+  
+  sigGenesPositive = names(which(table(df$ORF[df$positiveFC]) >=2))
+  sigGenesNegative = names(which(table(df$ORF[df$negativeFC]) >=2))
+  genesWithGuideCrossingPositiveDir = names(which(table(df$ORF[df$positiveFC]) >=2))
+  genesWithGuideCrossingNegativeDir = names(which(table(df$ORF[df$negativeFC]) >=2))
+  sigGenesPositive<-sigGenesPositive[!sigGenesPositive%in%genesWithGuideCrossingNegativeDir]
+  sigGenesNegative<-sigGenesNegative[!sigGenesNegative%in%genesWithGuideCrossingPositiveDir]
+  c(sigGenesPositive, sigGenesNegative)
+}
+
+dfs_list <- list(tab_ThirtyFC)
+#apply callSig function to guides
+loop_List <- lapply(dfs_list, function(u) {
+  sgenes  <- callSig(df=u, logFCcutoff = 1)
+  u$sig <- u$ORF %in% sgenes
+})
+
+tab_ThirtyFC$sig <- unlist(loop_List[1])
+
+#guide lvl
+qplot(x=tab_ThirtyFC$logCPM, y=tab_ThirtyFC$logFC, col=factor(tab_ThirtyFC$FDR<0.05)) + theme_classic()
+```
+
+```{r write gRNA log2FC table to file}
+#colnames ORF and gene specify the designed target ORF and gene, not the actual targets:
+colnames(tab_ThirtyFC)[10:17] = paste(colnames(tab_ThirtyFC)[10:17], "_targeted", sep="")
+#remove columns that were used for merging metadata
+tab_ThirtyFC = tab_ThirtyFC[, -c(2,8)]
+
+#gRNA target distribution
+table(tab_ThirtyFC$targetORFs150bpDistanceNumber)
+
+###write to file:
+#write.table(tab_ThirtyFC, file="./GuideScore_Thirty.txt", quote=F, sep="\t", row.names = F)	
+
+```
+
+```{r - gRNA volcano plots}
+plotTable_guides <- function(tab){
+  for (i in 1:length(rownames(tab))){
+    if ( (-log10( tab$FDR[i] )) <= 80){
+      tab$plot_fdr[i] = (-log10( tab$FDR[i] ))
+      tab$plot_pch[i] =  20 
+    }
+    if ( (-log10( tab$FDR[i] )) > 80){
+      tab$plot_fdr[i] = 80
+      tab$plot_pch[i] =  17   
+    }
+    if (tab$logFC[i] > (-15) | tab$logFC[i] < 5 ){
+      tab$logFC_trim[i] = tab$logFC[i]
+    }
+    if (tab$logFC[i] < (-15)){
+      tab$logFC_trim[i] = (-15)
+      tab$plot_pch[i] = 17
+    }
+    if (tab$logFC[i] > 5){
+      tab$logFC_trim[i] = 5
+      tab$plot_pch[i] = 17
+    }
+    if (tab$FDR[i] <= 0.05){
+      tab$FDR_col[i] <- alpha("grey4", 0.2)
+      if (tab$logFC[i] <= (-1) | tab$logFC[i] >= 1){
+        tab$FDR_col[i] <- alpha("chartreuse4", 0.2)
+      }
+    }
+    else{tab$FDR_col[i] <- alpha("darkred", 0.2)
+    }
+  }  
+  return(tab)
+}
+
+
+#generate tables with values for plotting:
+tab_ThirtyFC <- plotTable_guides(tab=tab_ThirtyFC)
+
+volcanoPlot <- function(tbl){
+  plot(tbl$logFC_trim, tbl$plot_fdr, pch=tbl$plot_pch, col=tbl$FDR_col, 
+       xlab = "log2 barcode fold change", ylab = "-log10 FDR", cex=1.4, cex.axis=1.4, cex.lab=1.4, xlim = c(-15.01,5.01), ylim = c(0,80))
+  legend(-16, 24, c("significant gRNA", "abs. log2FC<1", "FDR>0.05"), 
+         col=c(alpha("chartreuse4", 0.2), alpha("grey4", 0.2), alpha("darkred", 0.2)), 
+         pch=20, border="black", cex=0.75, bty = "n")
+  abline(h=(-log10(0.05)), v=c(-1,1), col = alpha("blue", 0.2), lwd=1, lty=2)
+  text(-12, 3, labels="FDR=0.05", cex = 0.75, col = alpha("blue", 0.5))
+}
+
+#pdf('../Volcano_Plots_gRNA_fold-changes/Volcano_gRNA_30degC.pdf', width=5, height=5)
+  volcanoPlot(tbl=tab_ThirtyFC)
+#dev.off()
+
+```
+
+Compute gene log2FCs without prior calculation of gRNA log2FCs:
+```{r - Compute gene level log2FC}
+#edgeR pipeline to compute FDRs on on gene level (using geometric mean of raw read counts per gene)
+fitGeneModel <- function(counts, annTable){
+  
+  #compute offsets used for guide level normalization for usage in the gene model:
+  Group_guideLvL <- annTable$grp
+  y_guideLvL  = DGEList(counts, group=Group_guideLvL)
+  y_guideLvL  = calcNormFactors(y_guideLvL)
+  offsets_guideLvL <- getOffset(y_guideLvL)
+  
+  ###########
+  #Similar pipeline as for individual gRNAs above:
+  #merge annotations1
+  fullAnno$mergeCol <-  sapply(fullAnno$mergeCol, function(u){ sub("late", "", u)})
+  
+  counts$rname = rownames(counts)
+  counts$mergeCol <-  sapply(counts$rname, function(u){ paste( unlist(strsplit(u, ":"))[c(2, 3, 4) ], collapse = ":") })
+  counts$mergeCol <-  sapply(counts$mergeCol, function(u){ paste( unlist(strsplit(u, "late-"))[1]) })
+  counts$mergeCol <-  sapply(counts$mergeCol, function(u){ sub("-noMode-noGuideCtr", "", u) })
+    
+  #annotate aimed strand and genomic positions
+  mergedDF <- merge(counts, fullAnno, by="mergeCol")
+  
+  #exclude wt. This value is only meaningful at the guide level, if at all:
+  mergedDF <- mergedDF[-grep("wt", mergedDF$Gene),]
+
+  ###########################
+  #aggregate on gene level
+  mergedDF$Gene_ORF <- paste(mergedDF$Gene, mergedDF$ORF, sep="_")
+  counts_annotated <- mergedDF[,c(2,3,4,5,16)] 
+
+  geneMatrix <- matrix(nrow= length(unique(counts_annotated$Gene_ORF)), ncol = (length(colnames(counts_annotated))-1) ) 
+  rownames(geneMatrix) <- unique(counts_annotated$Gene_ORF, sep="_")
+  colnames(geneMatrix) <- colnames(counts_annotated)[1:4]
+  geneMatrix <- data.frame(geneMatrix)
+  
+  #transform guide RNA barcode read counts into natural log scale, compute mean of all log scale counts that target the same gene, transform back with natural exponential function.
+  #this procedure yields the geometric mean of a gRNA barcodes with similar gene feature.
+  for (i in rownames(geneMatrix)){
+    geneMatrix[rownames(geneMatrix)==i, ] <- apply(counts_annotated[counts_annotated$Gene_ORF==i, 1:4], 2, FUN=function(reads){
+      geomMean <- round( exp( mean(log1p(reads) ))) #,na.rm=T)) )
+      return(geomMean)})
+  }
+  
+  Group <- annTable$grp
+  #generate DGEList and perform likelihood ratio test on gene level
+  y  = DGEList(geneMatrix, group=Group)
+
+  #Use offsets of guideLvL!
+  y  = calcNormFactors(y)
+  y$offset= offsets_guideLvL
+  
+  plotMDS(y)
+  
+  design <- model.matrix(~0+grp+replicate , data=annTable)
+  yDisp <- estimateDisp(y, design, robust=TRUE)  
+  plotBCV(yDisp)
+  #plotSmear(yDisp)
+  fit = glmFit(yDisp, design, robust=T)
+  #test for ATc effect at 30degC
+  lrt = glmLRT(fit, contrast = c(-1, 1, 0))
+  tab_ThirtyFC_geneLVL = topTags((lrt),n=nrow(yDisp))$table
+  
+  hist(tab_ThirtyFC_geneLVL$logFC, breaks=50)
+  hist(tab_ThirtyFC_geneLVL$FDR, breaks=50)
+
+  plotMD(lrt)
+  abline(h=c(-1,1), col="blue")
+  
+  tab_ThirtyFC_geneLVL$Gene_ORF <- rownames(tab_ThirtyFC_geneLVL)
+  
+  tabSelection = list(tab_ThirtyFC_geneLVL)
+  return(tabSelection)
+}
+
+tab_TF_geneLVL <- fitGeneModel(counts = Counts_TF, annTable = ann_TF)
+tab_Kin_geneLVL <- fitGeneModel(counts = Counts_Kin, annTable = ann_Kin)
+
+Thirty_geneLVL_geomMean <- rbind(tab_TF_geneLVL[[1]], tab_Kin_geneLVL[[1]])
+```
+
+```{r - Multiple gene target consideration}
+#Replacing genes by the locus if multiple genes in the locus are targeted to account for multiple gene targets nearby the targeted region
+geneLocusAnnotate <- function(geneLevelTable, guideLevelTable){
+  #create cloumn with gene and orf info
+  geneLevelTable$Gene =  sapply( geneLevelTable$Gene_ORF, function(spp){
+    unlist(strsplit(spp, split="_", fixed = T))[1]} )
+  geneLevelTable$GeneLocus_on_GeneLvL = as.character(geneLevelTable$Gene)
+  
+  #ddf table for annotation of genes in bidirectional promoter configuration and complex regions
+  ddf = data.frame("Gene_targeted" = guideLevelTable$Gene_targeted, "GeneLocus_on_GeneLvL" = guideLevelTable$GeneLocus_on_GeneLvL, stringsAsFactors = FALSE)
+  ddf = unique(ddf)
+  ddf$Gene_targeted = as.character(ddf$Gene_targeted)
+  ddf$GeneLocus_on_GeneLvL = as.character(ddf$GeneLocus_on_GeneLvL)
+  
+  geneLevelTable$GeneLocus_on_GeneLvL[geneLevelTable$Gene %in% ddf$Gene_targeted] = sapply(geneLevelTable$Gene[geneLevelTable$Gene %in% ddf$Gene_targeted], function(pp){
+    geneReplacement = ddf$GeneLocus_on_GeneLvL[ddf$Gene_targeted == pp]
+    geneReplacement
+  }) 
+  #call output
+  geneLevelTable[order(rownames(geneLevelTable)), ]
+}
+
+Thirty_geneLVL_geomMean = geneLocusAnnotate(geneLevelTable=Thirty_geneLVL_geomMean, guideLevelTable=tab_ThirtyFC)
+head(Thirty_geneLVL_geomMean)
+```
+
+```{r - write gene level log2FCs to file}
+#write.table(Thirty_geneLVL_geomMean,file="./Thirty_geneLVL_geomMean.txt",quote=F,sep="\t", row.names = F)				 
+```
+
+```{r - overview on gene level log2FCs}
+#all gene combinations
+allGenes <- as.character(unique(tab_ThirtyFC$GeneLocus_on_GeneLvL)) #290 single genes and gene combinations/loci targeted
+#Of the 290 targeted genes, 34 genes/gene loci are essential (11.7 %).
+essentialGenes <- as.character(unique(tab_ThirtyFC$GeneLocus_on_GeneLvL[tab_ThirtyFC$essential_any == TRUE]))
+#173 guide RNAs target regions with at least one essential gene in 150 bp distance:
+essentialGuides <- as.character(unique(tab_ThirtyFC$Seq[tab_ThirtyFC$essential_any == TRUE]))
+
+#gene lvl
+qplot(x=Thirty_geneLVL_geomMean$logCPM, y=Thirty_geneLVL_geomMean$logFC, col=factor(Thirty_geneLVL_geomMean$FDR<0.05)) + theme_classic()
+
+
+cols <- c("FDR<=0.01" = "dodgerblue4", "FDR<=0.05" = "dodgerblue1", "FDR>=0.05" = "grey40", "FDR>=0.05" = "grey40")
+qplot(logCPM, logFC, data = Thirty_geneLVL_geomMean, colour = FDR, main = "log2 fold changes of genes \n(geometric mean of all gRNAs targeting one gene)") +
+  scale_colour_gradientn(colors = cols, values=c(0, 0.01, 0.05, 0.5), breaks=c(0, 0.01, 0.05, 0.5))
+
+```
+
+```{r - volcano plots of gene level log2FCs}
+plotTable_geneLvL <- function(tab){
+  for (i in 1:length(rownames(tab))){
+    if ( (-log10( tab$FDR[i] )) <= 80){
+      tab$plot_fdr[i] = (-log10( tab$FDR[i] ))
+      tab$plot_pch[i] =  20 
+    }
+    if ( (-log10( tab$FDR[i] )) > 80){
+      tab$plot_fdr[i] = 80
+      tab$plot_pch[i] =  17   
+    }
+    if (tab$logFC[i] > (-5) | tab$logFC[i] < 2 ){
+      tab$logFC_trim[i] = tab$logFC[i]
+    }
+    if (tab$logFC[i] < (-5)){
+      tab$logFC_trim[i] = (-5)
+      tab$plot_pch[i] = 17
+    }
+    if (tab$logFC[i] > 2){
+      tab$logFC_trim[i] = 2
+      tab$plot_pch[i] = 17
+    }
+    if (tab$FDR[i] <= 0.05){
+      tab$FDR_col[i] <- alpha("grey4", 0.2)
+      if (tab$logFC[i] <= (-1) | tab$logFC[i] >= 1){
+        tab$FDR_col[i] <- alpha("chartreuse4", 0.2)
+      }
+    }
+    else{tab$FDR_col[i] <- alpha("darkred", 0.2)
+    }
+  }  
+  return(tab)
+}
+
+
+volcanoPlot_geneLVL <- function(tbl){
+  plot(tbl$logFC_trim, tbl$plot_fdr, pch=tbl$plot_pch, col=tbl$FDR_col, 
+       xlab = "log2 gene fold change", ylab = "-log10 FDR", cex=1.4, cex.axis=1.4, cex.lab=1.4, ylim = c(0,80), xlim = c(-5,2))
+  legend(-5.3, 28, c("gene with abs. log2FC>=1", "abs. log2FC<1", "FDR>0.05"), 
+         col=c(alpha("darkred", 0.2), alpha("grey4", 0.2), alpha("chartreuse4", 0.2)), 
+         pch=20, border="black", cex=0.85, bty = "n")
+  abline(h=(-log10(0.05)), v=c(-1,1), col = alpha("blue", 0.2), lwd=1, lty=2)
+  text(-4.4, 3, labels="FDR=0.05", cex = 0.8, col=alpha("blue", 0.2))
+}
+
+
+volcanoPlot_geneLVL(tbl=plotTable_geneLvL(Thirty_geneLVL_geomMean))
+
+```
+
+```{r - Gene log2FC calculation based on gRNA log2FCs, using all gRNAs or rank-based subsets}
+#Mean of guides as gene score, including significant gene annotation for genes:
+GeneScore_Thirty  <- aggregate(tab_ThirtyFC$logFC, list(tab_ThirtyFC$Gene_targeted, tab_ThirtyFC$ORF_targeted, tab_ThirtyFC$sig, tab_ThirtyFC$GeneLocus_on_GeneLvL, tab_ThirtyFC$essential_any_aggregate, tab_ThirtyFC$Identity_targeted, tab_ThirtyFC$Chromosome_targeted), mean)
+colnames(GeneScore_Thirty)  <- c("gene", "ORF", "sig", "GeneLocus_on_GeneLvL", "essential", "Identity", "Chromosome", "mean.score")
+
+#Calculate median gene scores
+GeneScore_Thirty$median.score  <- aggregate(tab_ThirtyFC$logFC, list(tab_ThirtyFC$Gene_targeted, tab_ThirtyFC$ORF_targeted, tab_ThirtyFC$sig, tab_ThirtyFC$GeneLocus_on_GeneLvL, tab_ThirtyFC$essential_any_aggregate, tab_ThirtyFC$Identity_targeted, tab_ThirtyFC$Chromosome_targeted), median)[,8]
+
+#sort by gene name column
+GeneScore_Thirty <- GeneScore_Thirty[order(GeneScore_Thirty$gene),]
+GeneScore_Thirty$gene = as.character(GeneScore_Thirty$gene)
+
+#calculate gene score based on one single most extreme guide (or zz most extreme guides)
+zz = 1
+function_MaxGuides <- function(guide_tbl){
+  #use by function to group the guide score table by gene
+  grouped_tbl <- by(guide_tbl, as.character(guide_tbl$Gene_targeted), function(x){
+    #sort the gene subtables by decreasing absolute logFC
+    guideSort_by_absFC <- x[order(abs(x$logFC), decreasing = T),]
+    GeneScore <- mean(guideSort_by_absFC$logFC[1:zz])
+    GeneScore
+  })
+  return(as.numeric(grouped_tbl))
+}
+GeneScore_Thirty$maxGuide.score <- function_MaxGuides(guide_tbl=tab_ThirtyFC)
+
+#calculate gene score based on 2 most extreme guides
+zz = 2
+GeneScore_Thirty$maxTwoGuides.score <- function_MaxGuides(guide_tbl=tab_ThirtyFC)
+
+#calculate gene score based on 3 most extreme guides
+zz = 3
+GeneScore_Thirty$maxThreeGuides.score <- function_MaxGuides(guide_tbl=tab_ThirtyFC)
+
+#calculate gene score based on 4 most extreme guides
+zz = 4
+GeneScore_Thirty$maxFourGuides.score <- function_MaxGuides(guide_tbl=tab_ThirtyFC)
+
+#calculate gene score based on 5 most extreme guides
+zz = 5
+GeneScore_Thirty$maxFiveGuides.score <- function_MaxGuides(guide_tbl=tab_ThirtyFC)
+```
+
+```{r - compare gene log2FC measures}
+#exemplary plots
+heatscatter(GeneScore_Thirty$mean.score, GeneScore_Thirty$maxGuide.score)
+heatscatter(GeneScore_Thirty$mean.score, GeneScore_Thirty$median.score)
+heatscatter(GeneScore_Thirty$mean.score, GeneScore_Thirty$maxTwoGuides.score)
+heatscatter(GeneScore_Thirty$mean.score, GeneScore_Thirty$maxThreeGuides.score)
+heatscatter(GeneScore_Thirty$median.score, GeneScore_Thirty$maxTwoGuides.score)
+
+
+#34 of the 290 genes are essential:
+table(GeneScore_Thirty$essential)
+
+#exemplary plots with essential genes
+heatscatter(GeneScore_Thirty$mean.score, GeneScore_Thirty$maxGuide.score)
+points(GeneScore_Thirty$mean.score[GeneScore_Thirty$essential], GeneScore_Thirty$maxGuide.score[GeneScore_Thirty$essential], col="green", pch=23)
+abline(h=0, col=alpha("black", 0.25))
+abline(v=0, col=alpha("black", 0.25))
+
+heatscatter(GeneScore_Thirty$mean.score, GeneScore_Thirty$median.score)
+points(GeneScore_Thirty$mean.score[GeneScore_Thirty$essential], GeneScore_Thirty$median.score[GeneScore_Thirty$essential], col="green", pch=23)
+abline(h=0, col=alpha("black", 0.25))
+abline(v=0, col=alpha("black", 0.25))
+
+heatscatter(GeneScore_Thirty$mean.score, GeneScore_Thirty$maxTwoGuides.score)
+points(GeneScore_Thirty$mean.score[GeneScore_Thirty$essential], GeneScore_Thirty$maxTwoGuides.score[GeneScore_Thirty$essential], col="green", pch=23)
+abline(h=0, col=alpha("black", 0.25))
+abline(v=0, col=alpha("black", 0.25))
+
+heatscatter(GeneScore_Thirty$mean.score, GeneScore_Thirty$maxThreeGuides.score)
+points(GeneScore_Thirty$mean.score[GeneScore_Thirty$essential], GeneScore_Thirty$maxThreeGuides.score[GeneScore_Thirty$essential], col="green", pch=23)
+abline(h=0, col=alpha("black", 0.25))
+abline(v=0, col=alpha("black", 0.25))
+
+heatscatter(GeneScore_Thirty$median.score, GeneScore_Thirty$maxTwoGuides.score)
+points(GeneScore_Thirty$median.score[GeneScore_Thirty$essential], GeneScore_Thirty$maxTwoGuides.score[GeneScore_Thirty$essential], col="green", pch=23)
+abline(h=0, col=alpha("black", 0.25))
+abline(v=0, col=alpha("black", 0.25))
+
+```
+
+```{r - Z-scores}
+df_list <- list(df1=GeneScore_Thirty)
+
+loop_dfList <- lapply(df_list, function(df) {
+  df$z_mean.score  <- ( df$mean.score - mean(df$mean.score) )/sd(df$mean.score) 
+  df$z_median.score  <- ( df$median.score - mean(df$median.score) )/sd(df$median.score) 
+  df$z_maxGuide.score  <- ( df$maxGuide.score - mean(na.omit(df$maxGuide.score)) )/sd(na.omit(df$maxGuide.score))
+  df$z_maxTwoGuides.score  <- ( df$maxTwoGuides.score - mean(na.omit(df$maxTwoGuides.score)) )/sd(na.omit(df$maxTwoGuides.score))
+  df$z_maxThreeGuides.score  <- ( df$maxThreeGuides.score - mean(na.omit(df$maxThreeGuides.score)) )/sd(na.omit(df$maxThreeGuides.score))
+  df$z_maxFourGuides.score  <- ( df$maxFourGuides.score - mean(na.omit(df$maxFourGuides.score)) )/sd(na.omit(df$maxFourGuides.score))
+  #order by gene locus
+  df[order(df$GeneLocus_on_GeneLvL), ]
+  return(df)
+})
+
+GeneScore_Thirty = loop_dfList$df1
+
+#append geometric mean logFCs and FDR on gene level from edgeR pipeline with geometric mean:
+Thirty_geneLVL_geomMean = Thirty_geneLVL_geomMean[order(Thirty_geneLVL_geomMean$Gene), ]
+
+GeneScore_Thirty$geomMean_logFC  <- Thirty_geneLVL_geomMean$logFC
+GeneScore_Thirty$geomMean_FDR  <- Thirty_geneLVL_geomMean$FDR
+
+```
+
+```{r - Comparison of gene log2FCs computed based on geometric mean of read counts per gene or based on gRNA log2FCs}
+#Compare geneLVL_geometric_Mean of guide RNAs with mean of gRNA logFCs:
+spearmanR = paste("r = ", as.character( round( cor(x=GeneScore_Thirty$mean.score, y=GeneScore_Thirty$geomMean_logFC, method='spearman'), digits=3) ) )
+
+  ggplot(GeneScore_Thirty) +
+    geom_point(aes(x=mean.score, y=geomMean_logFC, colour=essential), shape=19, size=2) +
+    annotate("text", x = -1.5, y = 0.5, color="black", label=spearmanR) +
+    scale_x_continuous(breaks=c(-10,-5, -2,-1,0,1), limits = c(-10, 1)) +
+    scale_y_continuous(breaks=c(-10,-5, -2,-1,0,1), limits = c(-10, 1)) +
+    scale_color_manual(values = c( alpha("chartreuse3", .1), alpha("orange3", .8)) ) +
+    theme_classic() +
+    theme(axis.text=element_text(size=15, colour = "black"),
+          axis.title = element_text(size = 12, colour = "black"),
+          axis.ticks = element_line(size = 0.8, colour = "black"),
+          axis.ticks.length=unit(0.2,"cm"),
+          legend.position="none"
+          #legend.title=element_blank(), legend.position="top"
+    ) + 
+    geom_hline(yintercept=0, linetype="dashed", color="#555555" ) +
+    geom_vline(xintercept=0, linetype="dashed", color="#555555" ) +
+    geom_abline(linetype="dashed", color="#555555") +
+    xlab("Geometric mean of log-scale barcode fold changes per gene") +
+    ylab("Log-scale fold change of the geometric mean \nof read counts per gene")
+```
+
+```{r - Detailed gRNA and gene scores for selected genes}
+#Vertical Boxplot:
+
+#select genes
+selectionGeneList <- c("MSN2", "MSN4", "HSF1", "SCH9", "RSC3", "TEA1")
+
+selectPlot <- tab_ThirtyFC[tab_ThirtyFC$Gene_targeted %in% selectionGeneList, ]
+selectPlot$Gene_targeted <- factor(selectPlot$Gene_targeted, levels = selectionGeneList)
+
+ggplot(data=selectPlot, 
+       mapping = aes(x = GeneLocus_on_GeneLvL, y = as.numeric(logFC))) +
+  geom_boxplot(outlier.color = "transparent") +
+    geom_hline(yintercept=1, linetype="dashed", color="darkblue") + 
+    geom_hline(yintercept=(-1), linetype="dashed", color="darkblue") +
+  geom_hline(yintercept=0, linetype="dashed", color="darkblue") + 
+#  scale_y_continuous(breaks=seq(-3,1,1), limits = c(-3.5,1.5)) +
+  geom_jitter(aes(color=FDR), size = 3, width = 0.1) +
+  scale_color_gradientn(colors = c("black", "grey50", "grey60", "grey70", "grey75", "grey80", "grey85", "grey90"), na.value = "red", limits=c(0,1), breaks=c(0,0.1,0.2,0.5,1)) + #"darkblue")) + 
+  theme_classic() + 
+  theme(axis.text.x=element_text(angle=90, size=10, vjust = 0.5, 
+                                 color="black"), 
+        axis.text.y=element_text(angle=90, size=10, hjust = 0.5, color = "black"),
+        axis.title = element_text(size = rel(1.5), face="bold"),
+        axis.ticks = element_line(size = 0.9),
+        axis.ticks.length=unit(0.2,"cm")
+  ) + 
+  xlab("Target Gene") + 
+  ylab("gRNA fold change") +
+  ggtitle(label="Repression effect on Growth at 30°C") +
+  geom_point(stat="summary", fun.y = "mean", colour="red3", size=5, pch=18)
+
+sessionInfo()
+```
+
